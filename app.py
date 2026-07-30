@@ -1,4 +1,3 @@
-import os
 import tempfile
 from pathlib import Path
 
@@ -8,7 +7,7 @@ import streamlit as st
 
 
 # ============================================================
-# CONFIGURACIÓN GENERAL
+# CONFIGURACIÓN
 # ============================================================
 
 DRIVE_FOLDER_URL = (
@@ -16,12 +15,7 @@ DRIVE_FOLDER_URL = (
     "1UQ_sPApThDd3xHMQPz0GvMuIfLTcd_4x?usp=sharing"
 )
 
-EXTENSIONES_PERMITIDAS = {
-    ".xlsx",
-    ".xls",
-    ".pdf",
-    ".csv",
-}
+EXTENSIONES_PERMITIDAS = {".xlsx", ".xls", ".pdf", ".csv"}
 
 
 # ============================================================
@@ -30,35 +24,22 @@ EXTENSIONES_PERMITIDAS = {
 
 def descargar_carpeta_drive(url: str, destino: str) -> list[str]:
     """
-    Descarga los archivos visibles de una carpeta pública de Google Drive.
+    Descarga una carpeta pública de Google Drive.
 
-    Parámetros
-    ----------
-    url:
-        Enlace público de la carpeta de Google Drive.
-    destino:
-        Carpeta temporal donde se guardarán los archivos.
-
-    Retorna
-    -------
-    list[str]
-        Lista de rutas descargadas.
+    Se usan únicamente los argumentos compatibles con las versiones
+    actuales de gdown.
     """
     archivos = gdown.download_folder(
         url=url,
         output=destino,
         quiet=True,
-        use_cookies=False,
-        remaining_ok=True,
     )
 
     return archivos or []
 
 
 def obtener_archivos_compatibles(carpeta: str) -> pd.DataFrame:
-    """
-    Busca archivos compatibles dentro de la carpeta descargada.
-    """
+    """Obtiene la lista de archivos Excel, PDF y CSV descargados."""
     registros = []
 
     for ruta in Path(carpeta).rglob("*"):
@@ -73,36 +54,26 @@ def obtener_archivos_compatibles(carpeta: str) -> pd.DataFrame:
         registros.append(
             {
                 "Archivo": ruta.name,
-                "Tipo": extension.replace(".", "").upper(),
+                "Tipo": extension[1:].upper(),
                 "Tamaño (MB)": round(ruta.stat().st_size / (1024 * 1024), 2),
                 "Ruta relativa": str(ruta.relative_to(carpeta)),
             }
         )
 
+    columnas = ["Archivo", "Tipo", "Tamaño (MB)", "Ruta relativa"]
+
     if not registros:
-        return pd.DataFrame(
-            columns=["Archivo", "Tipo", "Tamaño (MB)", "Ruta relativa"]
-        )
+        return pd.DataFrame(columns=columnas)
 
     return (
-        pd.DataFrame(registros)
+        pd.DataFrame(registros, columns=columnas)
         .sort_values(["Tipo", "Archivo"])
         .reset_index(drop=True)
     )
 
 
-def contar_por_tipo(df_archivos: pd.DataFrame) -> dict[str, int]:
-    """
-    Cuenta cuántos archivos existen por extensión.
-    """
-    if df_archivos.empty:
-        return {}
-
-    return df_archivos["Tipo"].value_counts().to_dict()
-
-
 # ============================================================
-# INTERFAZ STREAMLIT
+# INTERFAZ
 # ============================================================
 
 st.set_page_config(
@@ -112,23 +83,30 @@ st.set_page_config(
 )
 
 st.title("📊 SNII Insight")
-st.subheader("Integración histórica del Sistema Nacional de Investigadoras e Investigadores")
+st.subheader(
+    "Integración histórica del Sistema Nacional de "
+    "Investigadoras e Investigadores"
+)
 
 st.write(
-    "Esta primera versión se conecta con la carpeta pública de Google Drive, "
-    "descarga temporalmente sus archivos y muestra cuáles fueron encontrados."
+    "Esta primera versión consulta la carpeta pública de Google Drive "
+    "y muestra los archivos compatibles encontrados."
 )
 
 st.info(
-    "La carpeta de Google Drive debe tener permiso de acceso: "
+    "La carpeta debe estar compartida como "
     "“Cualquier persona con el enlace”."
 )
 
 with st.expander("Repositorio configurado"):
     st.code(DRIVE_FOLDER_URL)
 
-if st.button("🔄 Sincronizar archivos", type="primary", use_container_width=True):
-    with st.spinner("Conectando con Google Drive y descargando archivos..."):
+if st.button(
+    "🔄 Sincronizar archivos",
+    type="primary",
+    use_container_width=True,
+):
+    with st.spinner("Descargando archivos desde Google Drive..."):
         try:
             with tempfile.TemporaryDirectory() as carpeta_temporal:
                 archivos_descargados = descargar_carpeta_drive(
@@ -138,28 +116,33 @@ if st.button("🔄 Sincronizar archivos", type="primary", use_container_width=Tr
 
                 if not archivos_descargados:
                     st.error(
-                        "No se descargaron archivos. Verifica que la carpeta sea pública "
-                        "y que el enlace sea correcto."
+                        "Google Drive no devolvió archivos. Verifica que la "
+                        "carpeta sea pública y que contenga archivos descargables."
                     )
                     st.stop()
 
-                df_archivos = obtener_archivos_compatibles(carpeta_temporal)
+                df_archivos = obtener_archivos_compatibles(
+                    carpeta_temporal
+                )
 
                 if df_archivos.empty:
                     st.warning(
-                        "La carpeta fue consultada, pero no se encontraron archivos "
-                        "Excel, PDF o CSV compatibles."
+                        "La carpeta se descargó, pero no se encontraron "
+                        "archivos Excel, PDF o CSV."
                     )
                     st.stop()
 
-                conteos = contar_por_tipo(df_archivos)
+                conteos = df_archivos["Tipo"].value_counts().to_dict()
 
                 st.success("Sincronización terminada correctamente.")
 
                 col1, col2, col3, col4 = st.columns(4)
 
-                col1.metric("Archivos compatibles", len(df_archivos))
-                col2.metric("Excel", conteos.get("XLSX", 0) + conteos.get("XLS", 0))
+                col1.metric("Archivos", len(df_archivos))
+                col2.metric(
+                    "Excel",
+                    conteos.get("XLSX", 0) + conteos.get("XLS", 0),
+                )
                 col3.metric("PDF", conteos.get("PDF", 0))
                 col4.metric("CSV", conteos.get("CSV", 0))
 
@@ -170,10 +153,20 @@ if st.button("🔄 Sincronizar archivos", type="primary", use_container_width=Tr
                 )
 
                 st.caption(
-                    "En esta etapa los archivos sólo se descargan temporalmente. "
-                    "Todavía no se modifican ni se genera el archivo maestro."
+                    "Los archivos se descargan temporalmente y se eliminan "
+                    "al terminar esta ejecución."
                 )
 
+        except TypeError as error:
+            st.error(
+                "La versión instalada de gdown no es compatible con el código."
+            )
+            st.code(str(error))
+            st.write(
+                "Sustituye también el archivo requirements.txt por la "
+                "versión corregida."
+            )
+
         except Exception as error:
-            st.error("No fue posible completar la sincronización.")
+            st.error("No fue posible sincronizar la carpeta.")
             st.exception(error)
