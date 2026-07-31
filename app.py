@@ -6,8 +6,8 @@ from pathlib import Path
 
 import gdown
 import pandas as pd
-import pdfplumber
 import streamlit as st
+from pypdf import PdfReader
 
 
 # ============================================================
@@ -19,15 +19,8 @@ DRIVE_FOLDER_URL = (
     "1UQ_sPApThDd3xHMQPz0GvMuIfLTcd_4x?usp=sharing"
 )
 
-EXTENSIONES_PERMITIDAS = {".xlsx", ".xls", ".pdf", ".csv"}
-
-COLUMNAS_PDF_2025 = [
-    "CVU",
-    "APELLIDO_PATERNO",
-    "APELLIDO_MATERNO",
-    "NOMBRES",
-    "NIVEL",
-]
+EXTENSIONES = {".xlsx", ".xls", ".csv", ".pdf"}
+COLUMNAS_CONTROL = ["Archivo", "Tipo", "Tamaño (MB)", "Ruta relativa"]
 
 
 # ============================================================
@@ -35,130 +28,109 @@ COLUMNAS_PDF_2025 = [
 # ============================================================
 
 def normalizar_texto(valor) -> str:
-    """Convierte texto a mayúsculas, sin acentos y con espacios simples."""
     if valor is None or pd.isna(valor):
         return ""
 
-    texto = str(valor).strip()
-    texto = unicodedata.normalize("NFKD", texto)
-    texto = "".join(
-        caracter for caracter in texto
-        if not unicodedata.combining(caracter)
-    )
+    texto = unicodedata.normalize("NFKD", str(valor))
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
     texto = re.sub(r"\s+", " ", texto)
-    return texto.upper().strip()
+    return texto.strip().upper()
 
 
 def detectar_anio(texto: str):
-    """Busca un año entre 2000 y 2099 dentro de un texto."""
-    coincidencia = re.search(r"(20\d{2})", texto)
+    coincidencia = re.search(r"\b(20\d{2})\b", str(texto))
     return int(coincidencia.group(1)) if coincidencia else pd.NA
 
 
-def detectar_origen_pdf(nombre_archivo: str, texto_inicial: str = "") -> str:
-    """Clasifica el PDF por nombre o contenido."""
-    texto = normalizar_texto(f"{nombre_archivo} {texto_inicial}")
+def detectar_origen_2025(nombre: str, texto: str = "") -> str:
+    contenido = normalizar_texto(f"{nombre} {texto}")
 
-    if "EMERIT" in texto:
+    if "EMERIT" in contenido:
         return "Emérito"
-    if "RECONSIDER" in texto:
+    if "RECONSIDER" in contenido:
         return "Reconsideración"
     return "Primera ronda"
 
 
 def limpiar_encabezados(df: pd.DataFrame) -> pd.DataFrame:
-    """Limpia encabezados sin modificar los valores originales."""
     df = df.copy()
-    columnas = []
-    usados = {}
+    nuevas = []
+    repetidas = {}
 
     for columna in df.columns:
-        nombre = str(columna).strip()
-        nombre = re.sub(r"\s+", " ", nombre)
+        nombre = re.sub(r"\s+", " ", str(columna).strip())
 
         if not nombre or nombre.lower().startswith("unnamed"):
             nombre = "COLUMNA_SIN_NOMBRE"
 
-        repeticion = usados.get(nombre, 0)
-        usados[nombre] = repeticion + 1
+        numero = repetidas.get(nombre, 0) + 1
+        repetidas[nombre] = numero
 
-        if repeticion:
-            nombre = f"{nombre}_{repeticion + 1}"
+        nuevas.append(nombre if numero == 1 else f"{nombre}_{numero}")
 
-        columnas.append(nombre)
-
-    df.columns = columnas
+    df.columns = nuevas
     return df
 
 
-def descargar_carpeta_drive(url: str, destino: str) -> list[str]:
-    """Descarga una carpeta pública de Google Drive."""
+# ============================================================
+# GOOGLE DRIVE
+# ============================================================
+
+def descargar_drive(destino: str) -> list[str]:
     archivos = gdown.download_folder(
-        url=url,
+        url=DRIVE_FOLDER_URL,
         output=destino,
         quiet=True,
     )
     return archivos or []
 
 
-def obtener_archivos_compatibles(carpeta: str) -> pd.DataFrame:
-    """Lista archivos compatibles descargados."""
-    registros = []
+def listar_archivos(carpeta: str) -> pd.DataFrame:
+    filas = []
 
     for ruta in Path(carpeta).rglob("*"):
-        if not ruta.is_file():
+        if not ruta.is_file() or ruta.suffix.lower() not in EXTENSIONES:
             continue
 
-        extension = ruta.suffix.lower()
-        if extension not in EXTENSIONES_PERMITIDAS:
-            continue
-
-        registros.append(
+        filas.append(
             {
                 "Archivo": ruta.name,
-                "Tipo": extension[1:].upper(),
-                "Tamaño (MB)": round(ruta.stat().st_size / (1024 * 1024), 2),
+                "Tipo": ruta.suffix[1:].upper(),
+                "Tamaño (MB)": round(ruta.stat().st_size / 1048576, 2),
                 "Ruta relativa": str(ruta.relative_to(carpeta)),
                 "Ruta completa": str(ruta),
             }
         )
 
-    if not registros:
+    if not filas:
         return pd.DataFrame(
-            columns=[
-                "Archivo",
-                "Tipo",
-                "Tamaño (MB)",
-                "Ruta relativa",
-                "Ruta completa",
-            ]
+            columns=COLUMNAS_CONTROL + ["Ruta completa"]
         )
 
     return (
-        pd.DataFrame(registros)
+        pd.DataFrame(filas)
         .sort_values(["Tipo", "Archivo"])
         .reset_index(drop=True)
     )
 
 
 # ============================================================
-# LECTURA DE EXCEL Y CSV
+# EXCEL Y CSV
 # ============================================================
 
-def leer_excel_completo(ruta: Path) -> tuple[list[pd.DataFrame], list[dict]]:
-    """Lee todas las hojas con información de un archivo Excel."""
+def leer_excel(ruta: Path):
     tablas = []
     incidencias = []
 
     try:
         hojas = pd.read_excel(ruta, sheet_name=None, dtype=object)
 
-        for nombre_hoja, df in hojas.items():
+        for hoja, df in hojas.items():
             if df.empty:
                 continue
 
             df = limpiar_encabezados(df)
-            df.insert(0, "ORIGEN_HOJA", str(nombre_hoja))
+            df.insert(0, "ORIGEN_HOJA", str(hoja))
             df.insert(0, "ORIGEN_ARCHIVO", ruta.name)
 
             if "ANIO" not in df.columns:
@@ -179,13 +151,12 @@ def leer_excel_completo(ruta: Path) -> tuple[list[pd.DataFrame], list[dict]]:
     return tablas, incidencias
 
 
-def leer_csv(ruta: Path) -> tuple[pd.DataFrame | None, dict | None]:
-    """Lee CSV con varias codificaciones posibles."""
+def leer_csv(ruta: Path):
     ultimo_error = None
 
-    for codificacion in ("utf-8-sig", "utf-8", "latin-1"):
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
         try:
-            df = pd.read_csv(ruta, dtype=object, encoding=codificacion)
+            df = pd.read_csv(ruta, dtype=object, encoding=encoding)
             df = limpiar_encabezados(df)
             df.insert(0, "ORIGEN_HOJA", "CSV")
             df.insert(0, "ORIGEN_ARCHIVO", ruta.name)
@@ -207,182 +178,258 @@ def leer_csv(ruta: Path) -> tuple[pd.DataFrame | None, dict | None]:
 
 
 # ============================================================
-# EXTRACCIÓN DE PDF 2025
+# PDF: EXTRACCIÓN RÁPIDA POR TEXTO
 # ============================================================
 
-def fila_pdf_es_valida(valores: list[str]) -> bool:
-    """Valida que una fila parezca un registro real del SNII."""
-    if len(valores) < 5:
-        return False
+NIVEL_PATRON = (
+    r"(?:"
+    r"CANDIDAT[OA](?:\s+A\s+INVESTIGADOR(?:A)?\s+NACIONAL)?|"
+    r"INVESTIGADOR(?:A)?\s+NACIONAL\s+EMERIT[OA]|"
+    r"EMERIT[OA]|"
+    r"NIVEL\s*(?:1|2|3|I|II|III)|"
+    r"INVESTIGADOR(?:A)?\s+NACIONAL\s+(?:NIVEL\s*)?(?:1|2|3|I|II|III)"
+    r")"
+)
 
-    cvu = re.sub(r"\D", "", valores[0])
 
-    if not cvu:
-        return False
+def limpiar_linea_pdf(linea: str) -> str:
+    return re.sub(r"\s+", " ", str(linea or "")).strip()
 
-    texto_fila = normalizar_texto(" ".join(valores))
 
-    encabezados = (
+def es_encabezado_pdf(linea: str) -> bool:
+    texto = normalizar_texto(linea)
+    claves = (
         "APELLIDO PATERNO",
         "APELLIDO MATERNO",
         "NOMBRES",
         "NIVEL OTORGADO",
+        "RESULTADOS",
+        "SISTEMA NACIONAL",
+    )
+    return any(clave in texto for clave in claves)
+
+
+def separar_nombre(contenido: str):
+    """
+    Separación provisional:
+    primera palabra = apellido paterno,
+    segunda palabra = apellido materno,
+    resto = nombres.
+
+    Se conserva NOMBRE_COMPLETO_PDF para validar y corregir después.
+    """
+    partes = contenido.split()
+
+    if len(partes) < 3:
+        return "", "", contenido
+
+    return partes[0], partes[1], " ".join(partes[2:])
+
+
+def extraer_registros_lineas(lineas: list[str]) -> list[dict]:
+    registros = []
+    i = 0
+
+    patron_unalinea = re.compile(
+        rf"^(?P<cvu>\d{{4,12}})\s+"
+        rf"(?P<nombre>.+?)\s+"
+        rf"(?P<nivel>{NIVEL_PATRON})$",
+        re.IGNORECASE,
     )
 
-    return not any(encabezado in texto_fila for encabezado in encabezados)
+    while i < len(lineas):
+        linea = limpiar_linea_pdf(lineas[i])
 
-
-def convertir_fila_pdf(valores: list[str]) -> dict | None:
-    """
-    Convierte una fila de tabla PDF al formato estándar 2025.
-
-    El formato esperado es:
-    CVU | Apellido paterno | Apellido materno | Nombres | Nivel otorgado
-    """
-    valores = [
-        re.sub(r"\s+", " ", str(valor or "")).strip()
-        for valor in valores
-    ]
-
-    if not fila_pdf_es_valida(valores):
-        return None
-
-    return {
-        "CVU": re.sub(r"\D", "", valores[0]),
-        "APELLIDO_PATERNO": valores[1],
-        "APELLIDO_MATERNO": valores[2],
-        "NOMBRES": valores[3],
-        "NIVEL": valores[4],
-    }
-
-
-def extraer_registros_desde_tablas(
-    pagina,
-) -> list[dict]:
-    """Extrae registros usando las tablas detectadas por pdfplumber."""
-    registros = []
-
-    configuraciones = [
-        {},
-        {
-            "vertical_strategy": "lines",
-            "horizontal_strategy": "lines",
-        },
-        {
-            "vertical_strategy": "text",
-            "horizontal_strategy": "text",
-            "intersection_tolerance": 5,
-            "snap_tolerance": 4,
-            "join_tolerance": 4,
-        },
-    ]
-
-    for configuracion in configuraciones:
-        try:
-            tablas = pagina.extract_tables(
-                table_settings=configuracion or None
-            )
-        except Exception:
+        if not linea or es_encabezado_pdf(linea):
+            i += 1
             continue
 
-        for tabla in tablas or []:
-            for fila in tabla or []:
-                registro = convertir_fila_pdf(fila or [])
-                if registro:
-                    registros.append(registro)
+        # Caso 1: todo el registro quedó en una sola línea.
+        coincidencia = patron_unalinea.match(linea)
 
-        if registros:
-            break
+        if coincidencia:
+            nombre_completo = coincidencia.group("nombre").strip()
+            paterno, materno, nombres = separar_nombre(nombre_completo)
+
+            registros.append(
+                {
+                    "CVU": coincidencia.group("cvu"),
+                    "APELLIDO_PATERNO": paterno,
+                    "APELLIDO_MATERNO": materno,
+                    "NOMBRES": nombres,
+                    "NOMBRE_COMPLETO_PDF": nombre_completo,
+                    "NIVEL": coincidencia.group("nivel").strip(),
+                }
+            )
+            i += 1
+            continue
+
+        # Caso 2: CVU en una línea y campos en líneas posteriores.
+        if re.fullmatch(r"\d{4,12}", linea):
+            bloque = []
+            j = i + 1
+
+            while j < len(lineas) and len(bloque) < 8:
+                siguiente = limpiar_linea_pdf(lineas[j])
+
+                if re.fullmatch(r"\d{4,12}", siguiente):
+                    break
+
+                if siguiente and not es_encabezado_pdf(siguiente):
+                    bloque.append(siguiente)
+
+                if re.fullmatch(NIVEL_PATRON, siguiente, re.IGNORECASE):
+                    break
+
+                j += 1
+
+            if bloque:
+                nivel = bloque[-1]
+
+                if re.fullmatch(NIVEL_PATRON, nivel, re.IGNORECASE):
+                    campos_nombre = bloque[:-1]
+
+                    if len(campos_nombre) >= 3:
+                        paterno = campos_nombre[0]
+                        materno = campos_nombre[1]
+                        nombres = " ".join(campos_nombre[2:])
+                    else:
+                        nombre_completo = " ".join(campos_nombre)
+                        paterno, materno, nombres = separar_nombre(
+                            nombre_completo
+                        )
+
+                    registros.append(
+                        {
+                            "CVU": linea,
+                            "APELLIDO_PATERNO": paterno,
+                            "APELLIDO_MATERNO": materno,
+                            "NOMBRES": nombres,
+                            "NOMBRE_COMPLETO_PDF": " ".join(campos_nombre),
+                            "NIVEL": nivel,
+                        }
+                    )
+                    i = j + 1
+                    continue
+
+        i += 1
 
     return registros
 
 
-def extraer_registros_desde_texto(texto: str) -> list[dict]:
-    """
-    Método alternativo para PDFs donde las tablas no son reconocidas.
-
-    Busca líneas que comienzan con CVU y terminan con un nivel SNII.
-    """
+def extraer_pdf_pypdf(ruta: Path):
+    """Método principal: rápido y sin análisis geométrico de tablas."""
+    reader = PdfReader(str(ruta))
     registros = []
+    texto_inicial = ""
+    paginas_sin_registros = 0
 
-    niveles = (
-        r"(?:CANDIDAT[OA]|NIVEL\s*[123I]{1,3}|"
-        r"INVESTIGADOR(?:A)?\s+NACIONAL\s+(?:NIVEL\s*)?[123I]{1,3}|"
-        r"EMERIT[OA])"
-    )
+    for numero, page in enumerate(reader.pages, start=1):
+        texto = page.extract_text() or ""
 
-    for linea in (texto or "").splitlines():
-        linea = re.sub(r"\s+", " ", linea).strip()
+        if numero <= 2:
+            texto_inicial += " " + texto
 
-        patron = re.compile(
-            rf"^(?P<cvu>\d{{4,10}})\s+"
-            rf"(?P<contenido>.+?)\s+"
-            rf"(?P<nivel>{niveles})$",
-            flags=re.IGNORECASE,
+        filas = extraer_registros_lineas(texto.splitlines())
+
+        if not filas:
+            paginas_sin_registros += 1
+
+        for fila in filas:
+            fila["PAGINA_PDF"] = numero
+            registros.append(fila)
+
+    return registros, texto_inicial, paginas_sin_registros
+
+
+def extraer_pdf_pdfplumber_respaldo(ruta: Path):
+    """
+    Respaldo opcional. Se importa dentro de la función para que
+    la aplicación no se caiga al iniciar si la dependencia falla.
+    """
+    try:
+        import pdfplumber
+    except ModuleNotFoundError:
+        return [], "", 0
+
+    registros = []
+    texto_inicial = ""
+    paginas_sin_registros = 0
+
+    with pdfplumber.open(ruta) as pdf:
+        for numero, pagina in enumerate(pdf.pages, start=1):
+            texto = pagina.extract_text(
+                x_tolerance=2,
+                y_tolerance=3,
+            ) or ""
+
+            if numero <= 2:
+                texto_inicial += " " + texto
+
+            filas = extraer_registros_lineas(texto.splitlines())
+
+            if not filas:
+                paginas_sin_registros += 1
+
+            for fila in filas:
+                fila["PAGINA_PDF"] = numero
+                registros.append(fila)
+
+    return registros, texto_inicial, paginas_sin_registros
+
+
+def extraer_pdf(ruta: Path):
+    incidencias = []
+
+    try:
+        registros, texto_inicial, paginas_vacias = extraer_pdf_pypdf(ruta)
+
+        # Sólo usar el método más lento cuando PyPDF no obtuvo nada.
+        if not registros:
+            registros, texto_inicial, paginas_vacias = (
+                extraer_pdf_pdfplumber_respaldo(ruta)
+            )
+
+        if not registros:
+            incidencias.append(
+                {
+                    "Archivo": ruta.name,
+                    "Tipo": "PDF",
+                    "Estado": "Sin registros",
+                    "Detalle": (
+                        "El PDF abrió correctamente, pero no se reconocieron "
+                        "registros. Requiere ajuste específico del formato."
+                    ),
+                }
+            )
+            return pd.DataFrame(), incidencias
+
+        df = pd.DataFrame(registros).drop_duplicates(
+            subset=["CVU", "NOMBRE_COMPLETO_PDF", "NIVEL"]
         )
 
-        coincidencia = patron.match(linea)
-        if not coincidencia:
-            continue
+        df.insert(0, "ANIO", 2025)
+        df.insert(1, "ORIGEN_ARCHIVO", ruta.name)
+        df.insert(2, "ORIGEN_HOJA", "PDF")
+        df.insert(
+            3,
+            "ORIGEN_2025",
+            detectar_origen_2025(ruta.name, texto_inicial),
+        )
 
-        contenido = coincidencia.group("contenido").strip()
-        partes = contenido.split()
-
-        # Este método es de respaldo. Se requieren al menos:
-        # apellido paterno, apellido materno y un nombre.
-        if len(partes) < 3:
-            continue
-
-        registros.append(
+        incidencias.append(
             {
-                "CVU": coincidencia.group("cvu"),
-                "APELLIDO_PATERNO": partes[0],
-                "APELLIDO_MATERNO": partes[1],
-                "NOMBRES": " ".join(partes[2:]),
-                "NIVEL": coincidencia.group("nivel"),
+                "Archivo": ruta.name,
+                "Tipo": "PDF",
+                "Estado": "Procesado",
+                "Detalle": (
+                    f"{len(df)} registros extraídos; "
+                    f"{paginas_vacias} páginas sin registros."
+                ),
             }
         )
 
-    return registros
-
-
-def extraer_pdf_2025(ruta: Path) -> tuple[pd.DataFrame, list[dict]]:
-    """Extrae los registros de un PDF de resultados 2025."""
-    registros = []
-    incidencias = []
-    texto_inicial = ""
-
-    try:
-        with pdfplumber.open(ruta) as pdf:
-            total_paginas = len(pdf.pages)
-
-            for numero_pagina, pagina in enumerate(pdf.pages, start=1):
-                texto = pagina.extract_text() or ""
-
-                if numero_pagina <= 2:
-                    texto_inicial += f" {texto}"
-
-                registros_pagina = extraer_registros_desde_tablas(pagina)
-
-                if not registros_pagina:
-                    registros_pagina = extraer_registros_desde_texto(texto)
-
-                for registro in registros_pagina:
-                    registro["PAGINA_PDF"] = numero_pagina
-                    registros.append(registro)
-
-                if not registros_pagina:
-                    incidencias.append(
-                        {
-                            "Archivo": ruta.name,
-                            "Tipo": "PDF",
-                            "Estado": "Página sin registros",
-                            "Detalle": (
-                                f"No se identificaron registros en la página "
-                                f"{numero_pagina} de {total_paginas}."
-                            ),
-                        }
-                    )
+        return df.reset_index(drop=True), incidencias
 
     except Exception as error:
         incidencias.append(
@@ -395,144 +442,135 @@ def extraer_pdf_2025(ruta: Path) -> tuple[pd.DataFrame, list[dict]]:
         )
         return pd.DataFrame(), incidencias
 
-    if not registros:
-        incidencias.append(
-            {
-                "Archivo": ruta.name,
-                "Tipo": "PDF",
-                "Estado": "Sin registros",
-                "Detalle": (
-                    "El PDF fue abierto, pero no se pudo reconocer su tabla. "
-                    "Puede requerir un ajuste específico del extractor."
-                ),
-            }
-        )
-        return pd.DataFrame(), incidencias
-
-    origen = detectar_origen_pdf(ruta.name, texto_inicial)
-
-    df = pd.DataFrame(registros)
-    df = df.drop_duplicates(
-        subset=["CVU", "APELLIDO_PATERNO", "APELLIDO_MATERNO", "NOMBRES", "NIVEL"]
-    )
-
-    df.insert(0, "ANIO", 2025)
-    df.insert(1, "ORIGEN_ARCHIVO", ruta.name)
-    df.insert(2, "ORIGEN_HOJA", "PDF")
-    df.insert(3, "ORIGEN_2025", origen)
-
-    return df.reset_index(drop=True), incidencias
-
 
 # ============================================================
-# GENERACIÓN DE ARCHIVOS DE SALIDA
+# MASTER
 # ============================================================
 
-def construir_master(
-    df_archivos: pd.DataFrame,
-) -> tuple[bytes, bytes, dict]:
-    """Integra Excel, CSV y PDF en un archivo maestro."""
-    tablas = []
-    incidencias = []
-    pdf_extraidos = 0
-    registros_pdf = 0
+def crear_salidas(master, control, incidencias):
+    excel = BytesIO()
 
-    for _, archivo in df_archivos.iterrows():
-        ruta = Path(archivo["Ruta completa"])
-        extension = ruta.suffix.lower()
+    with pd.ExcelWriter(excel, engine="openpyxl") as writer:
+        master.to_excel(writer, sheet_name="MASTER", index=False)
+        control.to_excel(writer, sheet_name="CONTROL_ARCHIVOS", index=False)
 
-        if extension in {".xlsx", ".xls"}:
-            nuevas_tablas, nuevos_errores = leer_excel_completo(ruta)
-            tablas.extend(nuevas_tablas)
-            incidencias.extend(nuevos_errores)
+        if not incidencias.empty:
+            incidencias.to_excel(
+                writer,
+                sheet_name="INCIDENCIAS",
+                index=False,
+            )
 
-        elif extension == ".csv":
-            tabla, error = leer_csv(ruta)
-            if tabla is not None:
-                tablas.append(tabla)
-            if error is not None:
-                incidencias.append(error)
+    csv = master.to_csv(index=False).encode("utf-8-sig")
 
-        elif extension == ".pdf":
-            tabla_pdf, errores_pdf = extraer_pdf_2025(ruta)
-            incidencias.extend(errores_pdf)
+    parquet = BytesIO()
+    master.to_parquet(parquet, index=False)
 
-            if not tabla_pdf.empty:
-                tablas.append(tabla_pdf)
-                pdf_extraidos += 1
-                registros_pdf += len(tabla_pdf)
+    return excel.getvalue(), csv, parquet.getvalue()
 
-    if not tablas:
-        raise ValueError(
-            "No fue posible leer datos de los archivos sincronizados."
-        )
 
-    master = pd.concat(tablas, ignore_index=True, sort=False)
+@st.cache_data(ttl=3600, show_spinner=False)
+def sincronizar_y_procesar():
+    """
+    Cachea durante una hora la descarga y el procesamiento.
+    Al volver a presionar el botón, Streamlit reutiliza el resultado.
+    """
+    with tempfile.TemporaryDirectory() as carpeta:
+        descargados = descargar_drive(carpeta)
 
-    columnas_iniciales = [
-        columna
-        for columna in [
+        if not descargados:
+            raise RuntimeError(
+                "Google Drive no devolvió archivos. Verifica los permisos."
+            )
+
+        archivos = listar_archivos(carpeta)
+
+        if archivos.empty:
+            raise RuntimeError(
+                "No se encontraron archivos Excel, CSV o PDF."
+            )
+
+        tablas = []
+        incidencias = []
+
+        for _, fila in archivos.iterrows():
+            ruta = Path(fila["Ruta completa"])
+            extension = ruta.suffix.lower()
+
+            if extension in {".xlsx", ".xls"}:
+                nuevas, errores = leer_excel(ruta)
+                tablas.extend(nuevas)
+                incidencias.extend(errores)
+
+            elif extension == ".csv":
+                tabla, error = leer_csv(ruta)
+
+                if tabla is not None:
+                    tablas.append(tabla)
+                if error:
+                    incidencias.append(error)
+
+            elif extension == ".pdf":
+                tabla, mensajes = extraer_pdf(ruta)
+                incidencias.extend(mensajes)
+
+                if not tabla.empty:
+                    tablas.append(tabla)
+
+        if not tablas:
+            raise RuntimeError(
+                "No fue posible integrar ningún registro."
+            )
+
+        master = pd.concat(tablas, ignore_index=True, sort=False)
+
+        prioridad = [
             "ANIO",
             "ORIGEN_ARCHIVO",
             "ORIGEN_HOJA",
             "ORIGEN_2025",
             "PAGINA_PDF",
         ]
-        if columna in master.columns
-    ]
 
-    master = master[
-        columnas_iniciales
-        + [
-            columna
-            for columna in master.columns
-            if columna not in columnas_iniciales
-        ]
-    ]
+        primeras = [c for c in prioridad if c in master.columns]
+        restantes = [c for c in master.columns if c not in primeras]
+        master = master[primeras + restantes]
 
-    control_archivos = df_archivos[
-        ["Archivo", "Tipo", "Tamaño (MB)", "Ruta relativa"]
-    ].copy()
-
-    incidencias_df = pd.DataFrame(
-        incidencias,
-        columns=["Archivo", "Tipo", "Estado", "Detalle"],
-    )
-
-    salida_excel = BytesIO()
-
-    with pd.ExcelWriter(salida_excel, engine="openpyxl") as writer:
-        master.to_excel(writer, sheet_name="MASTER", index=False)
-        control_archivos.to_excel(
-            writer,
-            sheet_name="CONTROL_ARCHIVOS",
-            index=False,
+        control = archivos[COLUMNAS_CONTROL].copy()
+        incidencias_df = pd.DataFrame(
+            incidencias,
+            columns=["Archivo", "Tipo", "Estado", "Detalle"],
         )
 
-        if not incidencias_df.empty:
-            incidencias_df.to_excel(
-                writer,
-                sheet_name="INCIDENCIAS",
-                index=False,
-            )
+        excel, csv, parquet = crear_salidas(
+            master,
+            control,
+            incidencias_df,
+        )
 
-    # CSV para alimentar el HTML con mayor facilidad.
-    salida_csv = master.to_csv(index=False).encode("utf-8-sig")
+        resumen = {
+            "registros": len(master),
+            "archivos": master["ORIGEN_ARCHIVO"].nunique(),
+            "pdf": int(
+                master["ORIGEN_HOJA"].eq("PDF").sum()
+                if "ORIGEN_HOJA" in master.columns
+                else 0
+            ),
+            "incidencias": len(incidencias_df),
+        }
 
-    resumen = {
-        "registros": len(master),
-        "columnas": len(master.columns),
-        "archivos_integrados": master["ORIGEN_ARCHIVO"].nunique(),
-        "pdf_extraidos": pdf_extraidos,
-        "registros_pdf": registros_pdf,
-        "incidencias": len(incidencias_df),
-    }
-
-    return salida_excel.getvalue(), salida_csv, resumen
+        return (
+            excel,
+            csv,
+            parquet,
+            resumen,
+            control,
+            incidencias_df,
+        )
 
 
 # ============================================================
-# INTERFAZ STREAMLIT
+# INTERFAZ
 # ============================================================
 
 st.set_page_config(
@@ -542,129 +580,116 @@ st.set_page_config(
 )
 
 st.title("📊 SNII Insight")
-st.subheader(
-    "Integración histórica del Sistema Nacional de "
-    "Investigadoras e Investigadores"
-)
-
-st.write(
-    "Sincroniza el repositorio, integra los Excel históricos, "
-    "extrae los resultados publicados en PDF y genera archivos "
-    "listos para comenzar el dashboard HTML."
-)
+st.caption("Integración histórica y preparación de datos para HTML")
 
 st.info(
-    "La carpeta de Google Drive debe permitir el acceso mediante "
-    "“Cualquier persona con el enlace”."
+    "La primera ejecución puede tardar porque descarga y procesa todo. "
+    "Durante la siguiente hora, el resultado queda en caché."
 )
 
-with st.expander("Repositorio configurado"):
-    st.code(DRIVE_FOLDER_URL)
+col_sync, col_clear = st.columns([3, 1])
 
-for clave in ("master_excel", "master_csv", "resumen_master"):
-    if clave not in st.session_state:
-        st.session_state[clave] = None
+with col_sync:
+    ejecutar = st.button(
+        "🔄 Sincronizar y generar MASTER",
+        type="primary",
+        use_container_width=True,
+    )
 
-if st.button(
-    "🔄 Sincronizar y generar MASTER",
-    type="primary",
-    use_container_width=True,
-):
-    st.session_state.master_excel = None
-    st.session_state.master_csv = None
-    st.session_state.resumen_master = None
+with col_clear:
+    if st.button("🧹 Limpiar caché", use_container_width=True):
+        st.cache_data.clear()
+        st.session_state.clear()
+        st.success("Caché eliminado.")
 
-    with st.spinner(
-        "Descargando archivos, leyendo PDF y construyendo el MASTER..."
-    ):
-        try:
-            with tempfile.TemporaryDirectory() as carpeta_temporal:
-                archivos_descargados = descargar_carpeta_drive(
-                    DRIVE_FOLDER_URL,
-                    carpeta_temporal,
-                )
+if ejecutar:
+    barra = st.progress(10, text="Conectando con Google Drive...")
 
-                if not archivos_descargados:
-                    st.error(
-                        "Google Drive no devolvió archivos. Verifica el enlace "
-                        "y los permisos de la carpeta."
-                    )
-                    st.stop()
+    try:
+        barra.progress(35, text="Leyendo Excel y CSV...")
+        resultado = sincronizar_y_procesar()
+        barra.progress(90, text="Preparando archivos de descarga...")
 
-                df_archivos = obtener_archivos_compatibles(
-                    carpeta_temporal
-                )
+        (
+            excel_bytes,
+            csv_bytes,
+            parquet_bytes,
+            resumen,
+            control,
+            incidencias,
+        ) = resultado
 
-                if df_archivos.empty:
-                    st.warning(
-                        "No se encontraron archivos Excel, CSV o PDF."
-                    )
-                    st.stop()
+        st.session_state["resultado"] = resultado
+        barra.progress(100, text="Proceso terminado.")
 
-                excel_bytes, csv_bytes, resumen = construir_master(
-                    df_archivos
-                )
+    except Exception as error:
+        barra.empty()
+        st.error("No fue posible generar el archivo maestro.")
+        st.exception(error)
 
-                st.session_state.master_excel = excel_bytes
-                st.session_state.master_csv = csv_bytes
-                st.session_state.resumen_master = resumen
+if "resultado" in st.session_state:
+    (
+        excel_bytes,
+        csv_bytes,
+        parquet_bytes,
+        resumen,
+        control,
+        incidencias,
+    ) = st.session_state["resultado"]
 
-                st.success("El archivo maestro fue generado correctamente.")
+    st.success("Archivos preparados correctamente.")
 
-                st.dataframe(
-                    df_archivos.drop(columns=["Ruta completa"]),
-                    use_container_width=True,
-                    hide_index=True,
-                )
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Registros", f"{resumen['registros']:,}")
+    c2.metric("Archivos integrados", resumen["archivos"])
+    c3.metric("Registros PDF", f"{resumen['pdf']:,}")
+    c4.metric("Incidencias", resumen["incidencias"])
 
-        except Exception as error:
-            st.error("No fue posible construir el archivo maestro.")
-            st.exception(error)
+    with st.expander("Ver archivos sincronizados"):
+        st.dataframe(control, use_container_width=True, hide_index=True)
 
-if st.session_state.master_excel is not None:
-    resumen = st.session_state.resumen_master
+    d1, d2, d3 = st.columns(3)
 
-    st.divider()
-    st.subheader("📦 Archivos listos")
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Registros", f"{resumen['registros']:,}")
-    col2.metric("PDF procesados", resumen["pdf_extraidos"])
-    col3.metric("Registros de PDF", f"{resumen['registros_pdf']:,}")
-    col4.metric("Incidencias", resumen["incidencias"])
-
-    col_excel, col_csv = st.columns(2)
-
-    with col_excel:
+    with d1:
         st.download_button(
-            label="⬇️ Descargar SNII_MASTER.xlsx",
-            data=st.session_state.master_excel,
+            "⬇️ Descargar Excel",
+            data=excel_bytes,
             file_name="SNII_MASTER.xlsx",
             mime=(
                 "application/vnd.openxmlformats-officedocument."
                 "spreadsheetml.sheet"
             ),
-            type="primary",
             use_container_width=True,
+            type="primary",
         )
 
-    with col_csv:
+    with d2:
         st.download_button(
-            label="⬇️ Descargar SNII_MASTER.csv",
-            data=st.session_state.master_csv,
+            "⬇️ Descargar CSV",
+            data=csv_bytes,
             file_name="SNII_MASTER.csv",
             mime="text/csv",
             use_container_width=True,
         )
 
-    st.caption(
-        "El CSV es la salida más sencilla para comenzar el dashboard HTML. "
-        "El Excel conserva además las hojas CONTROL_ARCHIVOS e INCIDENCIAS."
-    )
-
-    if resumen["incidencias"] > 0:
-        st.warning(
-            "Revisa la hoja INCIDENCIAS. Las páginas de portada, avisos o "
-            "instrucciones pueden aparecer como páginas sin registros; eso "
-            "no necesariamente significa que la extracción haya fallado."
+    with d3:
+        st.download_button(
+            "⬇️ Descargar Parquet",
+            data=parquet_bytes,
+            file_name="SNII_MASTER.parquet",
+            mime="application/octet-stream",
+            use_container_width=True,
         )
+
+    if not incidencias.empty:
+        with st.expander("Ver incidencias"):
+            st.dataframe(
+                incidencias,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.caption(
+        "Para el dashboard HTML conviene usar Parquet o CSV. "
+        "Parquet carga más rápido y ocupa menos espacio."
+    )
